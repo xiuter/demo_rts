@@ -4,6 +4,13 @@ import { BattleScene } from "./phaser/BattleScene";
 import { GameUI } from "./ui/GameUI";
 import "./styles.css";
 
+interface TerritoryDemoWindow extends Window {
+  __territoryDemo?: {
+    simulation: GameSimulation;
+    scene?: BattleScene;
+  };
+}
+
 const app = document.querySelector<HTMLElement>("#app");
 if (!app) {
   throw new Error("Missing app root");
@@ -24,15 +31,14 @@ app.innerHTML = `
 `;
 
 const simulation = new GameSimulation();
-(window as Window & { __territoryDemo?: { simulation: GameSimulation } }).__territoryDemo = {
-  simulation,
-};
+const demoWindow = window as TerritoryDemoWindow;
 const uiRoot = document.querySelector<HTMLElement>("#ui-root");
 if (!uiRoot) {
   throw new Error("Missing UI root");
 }
 const ui = new GameUI(uiRoot, simulation);
 const battleScene = new BattleScene(simulation, (coord) => ui.selectCell(coord));
+demoWindow.__territoryDemo = { simulation, scene: battleScene };
 ui.attachScene(battleScene);
 
 new Phaser.Game({

@@ -1,4 +1,4 @@
-import { createConfig } from "./config";
+import { createConfig, UNIT_TYPES } from "./config";
 import { hexDistance, hexKey, hexNeighbors } from "./hex";
 import { findHexPath } from "./pathfinding";
 import type {
@@ -10,7 +10,9 @@ import type {
   GameConfig,
   HexCoord,
   PlayerId,
+  UnitDefinition,
   UnitState,
+  UnitType,
 } from "./types";
 
 const PLAYERS: PlayerId[] = ["blue", "red"];
@@ -33,6 +35,7 @@ export class GameSimulation {
   private idCounter = 0;
   private accumulator = 0;
   private aiAccumulator = 0;
+  private aiGoldReserve = 0;
   private pathVersion = 0;
   private readonly pathCache = new Map<string, HexCoord[]>();
 
@@ -51,10 +54,16 @@ export class GameSimulation {
     switch (command.type) {
       case "build":
         return this.build(command.player, command.kind, command.coord);
+      case "buildBarracks":
+        return this.buildBarracks(command.player, command.coord, command.unitType);
+      case "setBarracksProductionPaused":
+        return this.setBarracksProductionPaused(
+          command.player,
+          command.buildingId,
+          command.paused,
+        );
       case "upgrade":
         return this.upgrade(command.player, command.buildingId);
-      case "enqueueUnit":
-        return this.enqueueUnit(command.player, command.buildingId, command.unitType);
       case "pause":
         this.state.paused = command.value ?? !this.state.paused;
         this.touch();
@@ -86,8 +95,21 @@ export class GameSimulation {
     return income;
   }
 
+  getTrainableUnits(): UnitDefinition[] {
+    return UNIT_TYPES.map((unitType) => this.config.units[unitType]);
+  }
+
+  getUnitCap(): number {
+    return Math.max(1, this.config.unitCap);
+  }
+
+  getProductionDuration(unitType: UnitType): number {
+    const definition = this.config.units[unitType];
+    return definition.trainTime;
+  }
+
   getBuildingMaxHp(building: BuildingState): number {
-    return this.getBuildingLevel(building).maxHp;
+    return this.getBuildingMaxHpFor(building.kind, building.level);
   }
 
   getUnitMaxHp(unit: UnitState): number {
@@ -127,6 +149,7 @@ export class GameSimulation {
     this.idCounter = 0;
     this.accumulator = 0;
     this.aiAccumulator = 0;
+    this.aiGoldReserve = 0;
     this.pathVersion = 0;
     this.pathCache.clear();
     this.state = this.createInitialState();
@@ -181,9 +204,11 @@ export class GameSimulation {
       owner,
       kind: "city",
       level: 1,
-      hp: this.config.buildings.city.levels[0].maxHp,
+      hp: this.getBuildingMaxHpFor("city", 1),
       cooldown: 0,
-      queue: [],
+      autoUnitType: null,
+      production: null,
+      productionMode: null,
       ...coord,
     };
     this.state.buildings[id] = city;
@@ -194,7 +219,7 @@ export class GameSimulation {
 
   private build(
     player: PlayerId,
-    kind: Exclude<BuildingKind, "city">,
+    kind: Exclude<BuildingKind, "city" | "barracks">,
     coord: HexCoord,
   ): CommandResult {
     if (this.state.winner) {
@@ -214,9 +239,11 @@ export class GameSimulation {
       owner: player,
       kind,
       level: 1,
-      hp: definition.levels[0].maxHp,
+      hp: this.getBuildingMaxHpFor(kind, 1),
       cooldown: 0,
-      queue: [],
+      autoUnitType: null,
+      production: null,
+      productionMode: null,
       ...coord,
     };
     this.state.players[player].gold -= definition.buildCost;
@@ -226,6 +253,72 @@ export class GameSimulation {
     cell.owner = player;
     cell.buildingId = id;
     this.invalidatePaths();
+    this.touch();
+    return success();
+  }
+
+  private buildBarracks(player: PlayerId, coord: HexCoord, unitType: UnitType): CommandResult {
+    if (this.state.winner) {
+      return failure("战斗已经结束");
+    }
+    if (!this.canBuild(player, coord)) {
+      return failure("只能在己方边界的空地建造");
+    }
+    const unit = this.config.units[unitType];
+    if (!unit) {
+      return failure("兵种不存在");
+    }
+    const definition = this.config.buildings.barracks;
+    if (this.state.players[player].gold < definition.buildCost) {
+      return failure("金币不足");
+    }
+
+    const id = this.nextId("building");
+    const building: BuildingState = {
+      id,
+      owner: player,
+      kind: "barracks",
+      level: 1,
+      hp: this.getBuildingMaxHpFor("barracks", 1),
+      cooldown: 0,
+      autoUnitType: unitType,
+      production: null,
+      productionMode: "running",
+      ...coord,
+    };
+    this.state.players[player].gold -= definition.buildCost;
+    this.state.players[player].stats.buildingsBuilt += 1;
+    this.state.buildings[id] = building;
+    const cell = this.state.cells[hexKey(coord)];
+    cell.owner = player;
+    cell.buildingId = id;
+    this.invalidatePaths();
+    this.touch();
+    return success();
+  }
+
+  private setBarracksProductionPaused(
+    player: PlayerId,
+    buildingId: string,
+    paused: boolean,
+  ): CommandResult {
+    const building = this.state.buildings[buildingId];
+    if (!building || building.owner !== player) {
+      return failure("建筑不存在");
+    }
+    if (building.kind !== "barracks") {
+      return failure("只有兵营可以暂停生产");
+    }
+
+    if (!paused) {
+      building.productionMode = "running";
+      this.touch();
+      return success();
+    }
+
+    building.productionMode = building.production?.paid
+      ? "pauseAfterCurrent"
+      : "paused";
     this.touch();
     return success();
   }
@@ -248,35 +341,10 @@ export class GameSimulation {
       return failure("金币不足");
     }
 
-    const oldMaxHp = definition.levels[building.level - 1].maxHp;
+    const oldMaxHp = this.getBuildingMaxHpFor(building.kind, building.level);
     this.state.players[player].gold -= cost;
     building.level += 1;
-    building.hp += nextLevel.maxHp - oldMaxHp;
-    this.touch();
-    return success();
-  }
-
-  private enqueueUnit(player: PlayerId, buildingId: string, unitType: string): CommandResult {
-    const building = this.state.buildings[buildingId];
-    const definition = this.config.units[unitType];
-    if (!building || building.owner !== player || building.kind !== "barracks") {
-      return failure("请选择己方兵营");
-    }
-    if (!definition) {
-      return failure("兵种不存在");
-    }
-    if (building.queue.length >= this.config.queueCap) {
-      return failure("训练队列已满");
-    }
-    if (this.state.players[player].gold < definition.cost) {
-      return failure("金币不足");
-    }
-    this.state.players[player].gold -= definition.cost;
-    building.queue.push({
-      unitType,
-      level: Math.min(building.level, definition.levels.length),
-      remaining: definition.trainTime,
-    });
+    building.hp += this.getBuildingMaxHpFor(building.kind, building.level) - oldMaxHp;
     this.touch();
     return success();
   }
@@ -284,7 +352,7 @@ export class GameSimulation {
   private step(delta: number): void {
     this.state.elapsed += delta;
     this.processIncome(delta);
-    this.processTraining(delta);
+    this.processAutoProduction(delta);
     this.processTowers(delta);
     this.processUnits(delta);
     if (this.config.aiEnabled) {
@@ -305,24 +373,97 @@ export class GameSimulation {
     }
   }
 
-  private processTraining(delta: number): void {
+  private processAutoProduction(delta: number): void {
     for (const building of Object.values(this.state.buildings)) {
-      if (building.kind !== "barracks" || building.queue.length === 0) {
+      if (building.kind !== "barracks" || !building.autoUnitType) {
         continue;
       }
-      const order = building.queue[0];
-      order.remaining = Math.max(0, order.remaining - delta);
-      const unitCount = Object.values(this.state.units).filter(
-        (unit) => unit.owner === building.owner,
-      ).length;
-      if (order.remaining <= 0 && unitCount < this.config.unitCap) {
-        this.spawnUnit(building, order.unitType, order.level);
-        building.queue.shift();
+      if (building.productionMode === "paused") {
+        continue;
+      }
+      if (!building.production) {
+        if (building.productionMode === "pauseAfterCurrent") {
+          building.productionMode = "paused";
+          continue;
+        }
+        building.production = this.createPendingProduction(building);
+      }
+
+      const production = building.production;
+      if (!production.paid) {
+        if (building.productionMode === "pauseAfterCurrent") {
+          building.productionMode = "paused";
+          continue;
+        }
+        this.tryStartProduction(building, production);
+        continue;
+      }
+
+      production.remaining = Math.max(0, production.remaining - delta);
+      if (production.remaining > 0) {
+        production.pauseReason = null;
+        continue;
+      }
+
+      const availableSlots = this.getAvailableUnitSlots(building.owner);
+      if (availableSlots <= 0) {
+        production.pauseReason = "unitCap";
+        continue;
+      }
+
+      if (availableSlots > 0) {
+        this.spawnUnit(building, production.unitType, production.level);
+        building.production = null;
+        if (building.productionMode === "pauseAfterCurrent") {
+          building.productionMode = "paused";
+        }
       }
     }
   }
 
-  private spawnUnit(building: BuildingState, unitType: string, level: number): UnitState {
+  private createPendingProduction(building: BuildingState) {
+    const unitType = building.autoUnitType ?? this.getTrainableUnits()[0]?.id;
+    if (!unitType) {
+      throw new Error(`Missing auto unit for ${building.id}`);
+    }
+    const duration = this.getProductionDuration(unitType);
+    return {
+      unitType,
+      level: Math.min(building.level, this.config.units[unitType].levels.length),
+      remaining: duration,
+      duration,
+      paid: false,
+      pauseReason: null,
+    };
+  }
+
+  private tryStartProduction(building: BuildingState, production: NonNullable<BuildingState["production"]>): void {
+    if (this.getAvailableUnitSlots(building.owner) <= 0) {
+      production.pauseReason = "unitCap";
+      return;
+    }
+    const definition = this.config.units[production.unitType];
+    const reservedGold =
+      building.owner === "red" && this.config.aiEnabled ? this.aiGoldReserve : 0;
+    if (this.state.players[building.owner].gold < definition.cost + reservedGold) {
+      production.pauseReason = "gold";
+      return;
+    }
+
+    production.level = Math.min(building.level, definition.levels.length);
+    production.duration = this.getProductionDuration(production.unitType);
+    production.remaining = production.duration;
+    production.paid = true;
+    production.pauseReason = null;
+    this.state.players[building.owner].gold -= definition.cost;
+  }
+
+  private getAvailableUnitSlots(player: PlayerId): number {
+    const unitCount = Object.values(this.state.units).filter((unit) => unit.owner === player).length;
+    return this.getUnitCap() - unitCount;
+  }
+
+  private spawnUnit(building: BuildingState, unitType: UnitType, level: number): UnitState {
     const definition = this.config.units[unitType];
     const stats = definition.levels[level - 1];
     const id = this.nextId("unit");
@@ -358,7 +499,7 @@ export class GameSimulation {
         )
         .sort((a, b) => hexDistance(tower, a) - hexDistance(tower, b))[0];
       if (target && tower.cooldown <= 0) {
-        target.hp -= level.damage ?? 0;
+        this.damageUnit(target, level.damage ?? 0);
         tower.cooldown = level.attackInterval ?? 1;
       }
     }
@@ -376,31 +517,58 @@ export class GameSimulation {
       }
       const definition = this.config.units[unit.unitType];
       const stats = definition.levels[unit.level - 1];
+      const range = stats.range ?? 1;
       unit.cooldown = Math.max(0, unit.cooldown - delta);
 
-      const enemyUnit = Object.values(this.state.units)
+      const enemyUnits = Object.values(this.state.units)
         .filter(
           (candidate) =>
-            candidate.owner !== unit.owner && hexDistance(unit, candidate) <= 1,
+            candidate.owner !== unit.owner && hexDistance(unit, candidate) <= range,
         )
-        .sort((a, b) => a.hp - b.hp)[0];
-      if (enemyUnit) {
-        if (unit.cooldown <= 0) {
-          enemyUnit.hp -= stats.damage;
-          unit.cooldown = stats.attackInterval;
-        }
-        continue;
-      }
-
-      const enemyBuilding = Object.values(this.state.buildings)
+        .map((target) => ({
+          kind: "unit" as const,
+          target,
+          distance: hexDistance(unit, target),
+        }));
+      const enemyBuildings = Object.values(this.state.buildings)
         .filter(
           (building) =>
-            building.owner !== unit.owner && hexDistance(unit, building) <= 1,
+            building.owner !== unit.owner && hexDistance(unit, building) <= range,
         )
-        .sort((a, b) => (a.kind === "city" ? 1 : 0) - (b.kind === "city" ? 1 : 0))[0];
-      if (enemyBuilding) {
+        .map((target) => ({
+          kind: "building" as const,
+          target,
+          distance: hexDistance(unit, target),
+        }));
+      const attackTarget = [...enemyUnits, ...enemyBuildings].sort((a, b) => {
+        if (a.distance !== b.distance) {
+          return a.distance - b.distance;
+        }
+        if (a.kind !== b.kind) {
+          return a.kind === "unit" ? -1 : 1;
+        }
+        if (a.kind === "building" && b.kind === "building") {
+          const cityPriority = (a.target.kind === "city" ? 1 : 0) -
+            (b.target.kind === "city" ? 1 : 0);
+          if (cityPriority !== 0) {
+            return cityPriority;
+          }
+        }
+        if (a.target.hp !== b.target.hp) {
+          return a.target.hp - b.target.hp;
+        }
+        return a.target.id.localeCompare(b.target.id);
+      })[0];
+      if (attackTarget) {
         if (unit.cooldown <= 0) {
-          this.damageBuilding(enemyBuilding, stats.damage);
+          if (attackTarget.kind === "unit") {
+            this.damageUnit(attackTarget.target, stats.damage);
+          } else {
+            this.damageBuilding(
+              attackTarget.target,
+              stats.damage * stats.structureDamageMultiplier,
+            );
+          }
           unit.cooldown = stats.attackInterval;
         }
         continue;
@@ -447,6 +615,10 @@ export class GameSimulation {
     return path[1] ?? null;
   }
 
+  private damageUnit(unit: UnitState, damage: number): void {
+    unit.hp -= damage;
+  }
+
   private damageBuilding(building: BuildingState, damage: number): void {
     building.hp -= damage;
     if (building.hp > 0) {
@@ -478,28 +650,108 @@ export class GameSimulation {
     const mines = buildings.filter((building) => building.kind === "mine");
     const barracks = buildings.filter((building) => building.kind === "barracks");
     const towers = buildings.filter((building) => building.kind === "tower");
-    const gold = this.state.players[player].gold;
+    const desiredBarracksCount = this.getAiDesiredBarracksCount();
+    const preferredUnit = this.pickAiUnit();
+    const redUnitCount = Object.values(this.state.units).filter(
+      (unit) => unit.owner === player,
+    ).length;
+    const militaryProgress = Math.min(
+      14,
+      this.state.players.red.stats.unitsProduced,
+    );
+    const redCity = this.getCity("red");
+    const nearbyEnemies = Object.values(this.state.units).filter(
+      (unit) => unit.owner === "blue" && hexDistance(unit, redCity) <= 4,
+    );
+    const nearbyEnemyCount = nearbyEnemies.length;
+    const nearbyWarriors = nearbyEnemies.filter((unit) => unit.unitType === "warrior").length;
+    const immediateCounter: UnitType =
+      nearbyWarriors >= nearbyEnemyCount - nearbyWarriors ? "archer" : "warrior";
 
-    if (mines.length === 0 && gold >= this.config.buildings.mine.buildCost) {
-      this.aiBuild("mine");
+    if (mines.length === 0) {
+      this.aiPursuePurchase(
+        this.config.buildings.mine.buildCost,
+        barracks,
+        () => this.aiBuild("mine"),
+      );
       return;
     }
-    if (barracks.length === 0 && gold >= this.config.buildings.barracks.buildCost) {
-      this.aiBuild("barracks");
+    if (barracks.length === 0) {
+      this.aiPursuePurchase(
+        this.config.buildings.barracks.buildCost,
+        barracks,
+        () => this.aiBuildBarracks("warrior"),
+      );
       return;
     }
-
-    const queued = barracks.reduce((sum, building) => sum + building.queue.length, 0);
-    const units = Object.values(this.state.units).filter((unit) => unit.owner === player).length;
-    const infantry = this.config.units.infantry ?? Object.values(this.config.units)[0];
-    const readyBarracks = barracks.find((building) => building.queue.length < this.config.queueCap);
-    if (readyBarracks && units + queued < 10 && gold >= infantry.cost) {
-      this.enqueueUnit(player, readyBarracks.id, infantry.id);
+    if (
+      nearbyEnemyCount >= 2 &&
+      barracks.length < desiredBarracksCount &&
+      !barracks.some((building) => building.autoUnitType === immediateCounter)
+    ) {
+      if (this.aiNeedsMoreUnits(2, militaryProgress, barracks)) {
+        return;
+      }
+      this.aiPursuePurchase(
+        this.config.buildings.barracks.buildCost,
+        barracks,
+        () => this.aiBuildBarracks(immediateCounter),
+      );
       return;
     }
-
-    if (mines.length < 3 && gold >= this.config.buildings.mine.buildCost) {
-      this.aiBuild("mine");
+    if (nearbyEnemyCount >= 2 && towers.length < 3) {
+      if (this.aiNeedsMoreUnits(Math.min(6, nearbyEnemyCount + 2), redUnitCount, barracks)) {
+        return;
+      }
+      this.aiPursuePurchase(
+        this.config.buildings.tower.buildCost,
+        barracks,
+        () => this.aiBuild("tower"),
+      );
+      return;
+    }
+    if (mines.length < 2) {
+      if (this.aiNeedsMoreUnits(3, militaryProgress, barracks)) {
+        return;
+      }
+      this.aiPursuePurchase(
+        this.config.buildings.mine.buildCost,
+        barracks,
+        () => this.aiBuild("mine"),
+      );
+      return;
+    }
+    if (barracks.length < desiredBarracksCount) {
+      if (this.aiNeedsMoreUnits(barracks.length * 3, militaryProgress, barracks)) {
+        return;
+      }
+      this.aiPursuePurchase(
+        this.config.buildings.barracks.buildCost,
+        barracks,
+        () => this.aiBuildBarracks(preferredUnit),
+      );
+      return;
+    }
+    if (mines.length < 3) {
+      if (this.aiNeedsMoreUnits(8, militaryProgress, barracks)) {
+        return;
+      }
+      this.aiPursuePurchase(
+        this.config.buildings.mine.buildCost,
+        barracks,
+        () => this.aiBuild("mine"),
+      );
+      return;
+    }
+    if (towers.length < 3) {
+      if (this.aiNeedsMoreUnits(8 + towers.length * 2, militaryProgress, barracks)) {
+        return;
+      }
+      this.aiPursuePurchase(
+        this.config.buildings.tower.buildCost,
+        barracks,
+        () => this.aiBuild("tower"),
+      );
       return;
     }
 
@@ -507,36 +759,138 @@ export class GameSimulation {
       .filter((building) => building.level < this.config.buildings.mine.levels.length)
       .sort((a, b) => a.level - b.level)[0];
     if (mineToUpgrade) {
+      if (this.aiNeedsMoreUnits(12, militaryProgress, barracks)) {
+        return;
+      }
       const cost = this.config.buildings.mine.levels[mineToUpgrade.level].upgradeCost ?? 0;
-      if (gold >= cost) {
-        this.upgrade(player, mineToUpgrade.id);
-        return;
-      }
-    }
-
-    const barracksToUpgrade = barracks
-      .filter((building) => building.level < this.config.buildings.barracks.levels.length)
-      .sort((a, b) => a.level - b.level)[0];
-    if (barracksToUpgrade) {
-      const cost =
-        this.config.buildings.barracks.levels[barracksToUpgrade.level].upgradeCost ?? 0;
-      if (gold >= cost) {
-        this.upgrade(player, barracksToUpgrade.id);
-        return;
-      }
-    }
-
-    if (towers.length < 3 && gold >= this.config.buildings.tower.buildCost) {
-      this.aiBuild("tower");
+      this.aiPursuePurchase(cost, barracks, () => this.upgrade(player, mineToUpgrade.id));
       return;
     }
 
-    if (readyBarracks && gold >= infantry.cost) {
-      this.enqueueUnit(player, readyBarracks.id, infantry.id);
+    const preferredBarracks = barracks.filter(
+      (building) => building.autoUnitType === preferredUnit,
+    );
+    const barracksToUpgrade = (preferredBarracks.length > 0 ? preferredBarracks : barracks)
+      .filter((building) => building.level < this.config.buildings.barracks.levels.length)
+      .sort((a, b) => a.level - b.level)[0];
+    if (barracksToUpgrade) {
+      if (this.aiNeedsMoreUnits(14, militaryProgress, barracks)) {
+        return;
+      }
+      const cost =
+        this.config.buildings.barracks.levels[barracksToUpgrade.level].upgradeCost ?? 0;
+      this.aiPursuePurchase(
+        cost,
+        barracks,
+        () => this.upgrade(player, barracksToUpgrade.id),
+      );
+      return;
+    }
+
+    this.aiGoldReserve = 0;
+    this.resumeAiProduction(barracks);
+  }
+
+  private getAiDesiredBarracksCount(): number {
+    const blueBuildings = Object.values(this.state.buildings).filter(
+      (building) => building.owner === "blue",
+    );
+    const blueTowerCount = blueBuildings.filter((building) => building.kind === "tower").length;
+    const blueUnits = Object.values(this.state.units).filter((unit) => unit.owner === "blue");
+    const counts = UNIT_TYPES.map(
+      (unitType) => blueUnits.filter((unit) => unit.unitType === unitType).length,
+    );
+    const hasDominantArmy =
+      blueUnits.length >= 8 && Math.max(...counts) / blueUnits.length >= 0.6;
+    return blueTowerCount >= 2 || hasDominantArmy ? 4 : 3;
+  }
+
+  private pickAiUnit(): UnitType {
+    const redBarracks = Object.values(this.state.buildings).filter(
+      (building) => building.owner === "red" && building.kind === "barracks",
+    );
+    if (redBarracks.length === 0) {
+      return "warrior";
+    }
+
+    const blueBuildings = Object.values(this.state.buildings).filter(
+      (building) => building.owner === "blue",
+    );
+    const blueTowerCount = blueBuildings.filter((building) => building.kind === "tower").length;
+    const blueNonCityCount = blueBuildings.filter((building) => building.kind !== "city").length;
+    const hasSiegeBarracks = redBarracks.some(
+      (building) => building.autoUnitType === "siege",
+    );
+    if (!hasSiegeBarracks && (blueTowerCount > 0 || blueNonCityCount >= 4)) {
+      return "siege";
+    }
+
+    const blueUnits = Object.values(this.state.units).filter((unit) => unit.owner === "blue");
+    const warriorCount = blueUnits.filter((unit) => unit.unitType === "warrior").length;
+    const archerCount = blueUnits.filter((unit) => unit.unitType === "archer").length;
+    const siegeCount = blueUnits.filter((unit) => unit.unitType === "siege").length;
+    if (blueUnits.length > 0 && warriorCount >= archerCount + siegeCount) {
+      return "archer";
+    }
+    if (blueUnits.length > 0 && archerCount + siegeCount > warriorCount) {
+      return "warrior";
+    }
+
+    const barracksCounts = new Map<UnitType, number>(
+      UNIT_TYPES.map((unitType) => [
+        unitType,
+        redBarracks.filter((building) => building.autoUnitType === unitType).length,
+      ]),
+    );
+    return UNIT_TYPES.reduce((leastRepresented, unitType) =>
+      (barracksCounts.get(unitType) ?? 0) <
+      (barracksCounts.get(leastRepresented) ?? 0)
+        ? unitType
+        : leastRepresented,
+    );
+  }
+
+  private aiPursuePurchase(
+    cost: number,
+    barracks: BuildingState[],
+    purchase: () => unknown,
+  ): void {
+    this.resumeAiProduction(barracks);
+    this.aiGoldReserve = cost;
+    if (this.state.players.red.gold < cost) {
+      return;
+    }
+
+    purchase();
+    this.aiGoldReserve = 0;
+    const currentBarracks = Object.values(this.state.buildings).filter(
+      (building) => building.owner === "red" && building.kind === "barracks",
+    );
+    this.resumeAiProduction(currentBarracks);
+  }
+
+  private aiNeedsMoreUnits(
+    minimumUnits: number,
+    currentUnits: number,
+    barracks: BuildingState[],
+  ): boolean {
+    if (currentUnits >= minimumUnits) {
+      return false;
+    }
+    this.aiGoldReserve = 0;
+    this.resumeAiProduction(barracks);
+    return true;
+  }
+
+  private resumeAiProduction(barracks: BuildingState[]): void {
+    for (const building of barracks) {
+      if (building.productionMode !== "running") {
+        this.setBarracksProductionPaused("red", building.id, false);
+      }
     }
   }
 
-  private aiBuild(kind: Exclude<BuildingKind, "city">): void {
+  private aiBuild(kind: Exclude<BuildingKind, "city" | "barracks">): void {
     const target = this.getCity("blue");
     const candidates = this.getValidBuildCells("red").sort(
       (a, b) => hexDistance(a, target) - hexDistance(b, target),
@@ -547,8 +901,23 @@ export class GameSimulation {
     }
   }
 
+  private aiBuildBarracks(unitType: UnitType): void {
+    const target = this.getCity("blue");
+    const candidates = this.getValidBuildCells("red").sort(
+      (a, b) => hexDistance(a, target) - hexDistance(b, target),
+    );
+    const chosen = candidates[0];
+    if (chosen) {
+      this.buildBarracks("red", chosen, unitType);
+    }
+  }
+
   private getBuildingLevel(building: BuildingState) {
     return this.config.buildings[building.kind].levels[building.level - 1];
+  }
+
+  private getBuildingMaxHpFor(kind: BuildingKind, level: number): number {
+    return this.config.buildings[kind].levels[level - 1].maxHp;
   }
 
   private invalidatePaths(): void {

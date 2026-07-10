@@ -1,5 +1,6 @@
 export type PlayerId = "blue" | "red";
 export type BuildingKind = "city" | "mine" | "barracks" | "tower";
+export type UnitType = "warrior" | "archer" | "siege";
 
 export interface HexCoord {
   col: number;
@@ -25,13 +26,18 @@ export interface BuildingDefinition {
 export interface UnitLevel {
   maxHp: number;
   damage: number;
+  range: number;
   speed: number;
   attackInterval: number;
+  structureDamageMultiplier: number;
 }
 
 export interface UnitDefinition {
-  id: string;
+  id: UnitType;
   label: string;
+  icon: string;
+  summary: string;
+  accentColor: string;
   cost: number;
   trainTime: number;
   levels: UnitLevel[];
@@ -45,12 +51,11 @@ export interface GameConfig {
   startingGold: number;
   baseIncome: number;
   unitCap: number;
-  queueCap: number;
   fixedStep: number;
   aiDecisionInterval: number;
   aiEnabled: boolean;
   buildings: Record<BuildingKind, BuildingDefinition>;
-  units: Record<string, UnitDefinition>;
+  units: Record<UnitType, UnitDefinition>;
 }
 
 export interface CellState extends HexCoord {
@@ -58,10 +63,16 @@ export interface CellState extends HexCoord {
   buildingId: string | null;
 }
 
-export interface TrainingOrder {
-  unitType: string;
+export type ProductionPauseReason = "gold" | "unitCap";
+export type BarracksProductionMode = "running" | "pauseAfterCurrent" | "paused";
+
+export interface BarracksProductionState {
+  unitType: UnitType;
   level: number;
   remaining: number;
+  duration: number;
+  paid: boolean;
+  pauseReason: ProductionPauseReason | null;
 }
 
 export interface BuildingState extends HexCoord {
@@ -71,13 +82,15 @@ export interface BuildingState extends HexCoord {
   level: number;
   hp: number;
   cooldown: number;
-  queue: TrainingOrder[];
+  autoUnitType: UnitType | null;
+  production: BarracksProductionState | null;
+  productionMode: BarracksProductionMode | null;
 }
 
 export interface UnitState extends HexCoord {
   id: string;
   owner: PlayerId;
-  unitType: string;
+  unitType: UnitType;
   level: number;
   hp: number;
   cooldown: number;
@@ -110,9 +123,15 @@ export interface BattleState {
 }
 
 export type GameCommand =
-  | { type: "build"; player: PlayerId; kind: Exclude<BuildingKind, "city">; coord: HexCoord }
+  | { type: "build"; player: PlayerId; kind: Exclude<BuildingKind, "city" | "barracks">; coord: HexCoord }
+  | { type: "buildBarracks"; player: PlayerId; coord: HexCoord; unitType: UnitType }
+  | {
+      type: "setBarracksProductionPaused";
+      player: PlayerId;
+      buildingId: string;
+      paused: boolean;
+    }
   | { type: "upgrade"; player: PlayerId; buildingId: string }
-  | { type: "enqueueUnit"; player: PlayerId; buildingId: string; unitType: string }
   | { type: "pause"; value?: boolean }
   | { type: "restart" };
 
@@ -120,4 +139,3 @@ export interface CommandResult {
   ok: boolean;
   reason?: string;
 }
-
