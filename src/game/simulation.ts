@@ -1,6 +1,8 @@
+import { AiPlanner, createAiMemory } from "./ai";
 import { createConfig, UNIT_TYPES } from "./config";
 import { hexDistance, hexKey, hexNeighbors } from "./hex";
 import { findHexPath } from "./pathfinding";
+import type { AiAction, AiDecisionTrace, AiMemory } from "./ai";
 import type {
   BattleState,
   BuildingKind,
@@ -36,11 +38,15 @@ export class GameSimulation {
   private accumulator = 0;
   private aiAccumulator = 0;
   private aiGoldReserve = 0;
+  private aiPlanner: AiPlanner;
+  private aiMemory: AiMemory;
   private pathVersion = 0;
   private readonly pathCache = new Map<string, HexCoord[]>();
 
   constructor(config: GameConfig = createConfig()) {
     this.config = config;
+    this.aiPlanner = new AiPlanner(this.config);
+    this.aiMemory = createAiMemory(this.config);
     this.state = this.createInitialState();
   }
 
@@ -145,11 +151,18 @@ export class GameSimulation {
     return city;
   }
 
+  getAiDecisionTrace(): Readonly<AiDecisionTrace> | null {
+    const trace = this.aiPlanner.getTrace();
+    return trace ? structuredClone(trace) : null;
+  }
+
   restart(): void {
     this.idCounter = 0;
     this.accumulator = 0;
     this.aiAccumulator = 0;
     this.aiGoldReserve = 0;
+    this.aiPlanner = new AiPlanner(this.config);
+    this.aiMemory = createAiMemory(this.config);
     this.pathVersion = 0;
     this.pathCache.clear();
     this.state = this.createInitialState();
@@ -355,7 +368,7 @@ export class GameSimulation {
     this.processAutoProduction(delta);
     this.processTowers(delta);
     this.processUnits(delta);
-    if (this.config.aiEnabled) {
+    if (this.config.aiEnabled && !this.state.winner) {
       this.aiAccumulator += delta;
       if (this.aiAccumulator >= this.config.aiDecisionInterval) {
         this.aiAccumulator = 0;
@@ -643,272 +656,40 @@ export class GameSimulation {
   }
 
   private runAiTurn(): void {
-    const player: PlayerId = "red";
-    const buildings = Object.values(this.state.buildings).filter(
-      (building) => building.owner === player,
-    );
-    const mines = buildings.filter((building) => building.kind === "mine");
-    const barracks = buildings.filter((building) => building.kind === "barracks");
-    const towers = buildings.filter((building) => building.kind === "tower");
-    const desiredBarracksCount = this.getAiDesiredBarracksCount();
-    const preferredUnit = this.pickAiUnit();
-    const redUnitCount = Object.values(this.state.units).filter(
-      (unit) => unit.owner === player,
-    ).length;
-    const militaryProgress = Math.min(
-      14,
-      this.state.players.red.stats.unitsProduced,
-    );
-    const redCity = this.getCity("red");
-    const nearbyEnemies = Object.values(this.state.units).filter(
-      (unit) => unit.owner === "blue" && hexDistance(unit, redCity) <= 4,
-    );
-    const nearbyEnemyCount = nearbyEnemies.length;
-    const nearbyWarriors = nearbyEnemies.filter((unit) => unit.unitType === "warrior").length;
-    const immediateCounter: UnitType =
-      nearbyWarriors >= nearbyEnemyCount - nearbyWarriors ? "archer" : "warrior";
+    const plan = this.aiPlanner.plan(this.state, this.aiMemory);
+    this.aiMemory = plan.nextMemory;
+    this.aiGoldReserve = Number.isFinite(plan.reserveGold)
+      ? Math.max(0, plan.reserveGold)
+      : 0;
 
-    if (mines.length === 0) {
-      this.aiPursuePurchase(
-        this.config.buildings.mine.buildCost,
-        barracks,
-        () => this.aiBuild("mine"),
-      );
-      return;
-    }
-    if (barracks.length === 0) {
-      this.aiPursuePurchase(
-        this.config.buildings.barracks.buildCost,
-        barracks,
-        () => this.aiBuildBarracks("warrior"),
-      );
-      return;
-    }
-    if (
-      nearbyEnemyCount >= 2 &&
-      barracks.length < desiredBarracksCount &&
-      !barracks.some((building) => building.autoUnitType === immediateCounter)
-    ) {
-      if (this.aiNeedsMoreUnits(2, militaryProgress, barracks)) {
-        return;
-      }
-      this.aiPursuePurchase(
-        this.config.buildings.barracks.buildCost,
-        barracks,
-        () => this.aiBuildBarracks(immediateCounter),
-      );
-      return;
-    }
-    if (nearbyEnemyCount >= 2 && towers.length < 3) {
-      if (this.aiNeedsMoreUnits(Math.min(6, nearbyEnemyCount + 2), redUnitCount, barracks)) {
-        return;
-      }
-      this.aiPursuePurchase(
-        this.config.buildings.tower.buildCost,
-        barracks,
-        () => this.aiBuild("tower"),
-      );
-      return;
-    }
-    if (mines.length < 2) {
-      if (this.aiNeedsMoreUnits(3, militaryProgress, barracks)) {
-        return;
-      }
-      this.aiPursuePurchase(
-        this.config.buildings.mine.buildCost,
-        barracks,
-        () => this.aiBuild("mine"),
-      );
-      return;
-    }
-    if (barracks.length < desiredBarracksCount) {
-      if (this.aiNeedsMoreUnits(barracks.length * 3, militaryProgress, barracks)) {
-        return;
-      }
-      this.aiPursuePurchase(
-        this.config.buildings.barracks.buildCost,
-        barracks,
-        () => this.aiBuildBarracks(preferredUnit),
-      );
-      return;
-    }
-    if (mines.length < 3) {
-      if (this.aiNeedsMoreUnits(8, militaryProgress, barracks)) {
-        return;
-      }
-      this.aiPursuePurchase(
-        this.config.buildings.mine.buildCost,
-        barracks,
-        () => this.aiBuild("mine"),
-      );
-      return;
-    }
-    if (towers.length < 3) {
-      if (this.aiNeedsMoreUnits(8 + towers.length * 2, militaryProgress, barracks)) {
-        return;
-      }
-      this.aiPursuePurchase(
-        this.config.buildings.tower.buildCost,
-        barracks,
-        () => this.aiBuild("tower"),
-      );
-      return;
-    }
-
-    const mineToUpgrade = mines
-      .filter((building) => building.level < this.config.buildings.mine.levels.length)
-      .sort((a, b) => a.level - b.level)[0];
-    if (mineToUpgrade) {
-      if (this.aiNeedsMoreUnits(12, militaryProgress, barracks)) {
-        return;
-      }
-      const cost = this.config.buildings.mine.levels[mineToUpgrade.level].upgradeCost ?? 0;
-      this.aiPursuePurchase(cost, barracks, () => this.upgrade(player, mineToUpgrade.id));
-      return;
-    }
-
-    const preferredBarracks = barracks.filter(
-      (building) => building.autoUnitType === preferredUnit,
-    );
-    const barracksToUpgrade = (preferredBarracks.length > 0 ? preferredBarracks : barracks)
-      .filter((building) => building.level < this.config.buildings.barracks.levels.length)
-      .sort((a, b) => a.level - b.level)[0];
-    if (barracksToUpgrade) {
-      if (this.aiNeedsMoreUnits(14, militaryProgress, barracks)) {
-        return;
-      }
-      const cost =
-        this.config.buildings.barracks.levels[barracksToUpgrade.level].upgradeCost ?? 0;
-      this.aiPursuePurchase(
-        cost,
-        barracks,
-        () => this.upgrade(player, barracksToUpgrade.id),
-      );
-      return;
-    }
-
-    this.aiGoldReserve = 0;
-    this.resumeAiProduction(barracks);
-  }
-
-  private getAiDesiredBarracksCount(): number {
-    const blueBuildings = Object.values(this.state.buildings).filter(
-      (building) => building.owner === "blue",
-    );
-    const blueTowerCount = blueBuildings.filter((building) => building.kind === "tower").length;
-    const blueUnits = Object.values(this.state.units).filter((unit) => unit.owner === "blue");
-    const counts = UNIT_TYPES.map(
-      (unitType) => blueUnits.filter((unit) => unit.unitType === unitType).length,
-    );
-    const hasDominantArmy =
-      blueUnits.length >= 8 && Math.max(...counts) / blueUnits.length >= 0.6;
-    return blueTowerCount >= 2 || hasDominantArmy ? 4 : 3;
-  }
-
-  private pickAiUnit(): UnitType {
-    const redBarracks = Object.values(this.state.buildings).filter(
-      (building) => building.owner === "red" && building.kind === "barracks",
-    );
-    if (redBarracks.length === 0) {
-      return "warrior";
-    }
-
-    const blueBuildings = Object.values(this.state.buildings).filter(
-      (building) => building.owner === "blue",
-    );
-    const blueTowerCount = blueBuildings.filter((building) => building.kind === "tower").length;
-    const blueNonCityCount = blueBuildings.filter((building) => building.kind !== "city").length;
-    const hasSiegeBarracks = redBarracks.some(
-      (building) => building.autoUnitType === "siege",
-    );
-    if (!hasSiegeBarracks && (blueTowerCount > 0 || blueNonCityCount >= 4)) {
-      return "siege";
-    }
-
-    const blueUnits = Object.values(this.state.units).filter((unit) => unit.owner === "blue");
-    const warriorCount = blueUnits.filter((unit) => unit.unitType === "warrior").length;
-    const archerCount = blueUnits.filter((unit) => unit.unitType === "archer").length;
-    const siegeCount = blueUnits.filter((unit) => unit.unitType === "siege").length;
-    if (blueUnits.length > 0 && warriorCount >= archerCount + siegeCount) {
-      return "archer";
-    }
-    if (blueUnits.length > 0 && archerCount + siegeCount > warriorCount) {
-      return "warrior";
-    }
-
-    const barracksCounts = new Map<UnitType, number>(
-      UNIT_TYPES.map((unitType) => [
-        unitType,
-        redBarracks.filter((building) => building.autoUnitType === unitType).length,
-      ]),
-    );
-    return UNIT_TYPES.reduce((leastRepresented, unitType) =>
-      (barracksCounts.get(unitType) ?? 0) <
-      (barracksCounts.get(leastRepresented) ?? 0)
-        ? unitType
-        : leastRepresented,
-    );
-  }
-
-  private aiPursuePurchase(
-    cost: number,
-    barracks: BuildingState[],
-    purchase: () => unknown,
-  ): void {
-    this.resumeAiProduction(barracks);
-    this.aiGoldReserve = cost;
-    if (this.state.players.red.gold < cost) {
-      return;
-    }
-
-    purchase();
-    this.aiGoldReserve = 0;
-    const currentBarracks = Object.values(this.state.buildings).filter(
-      (building) => building.owner === "red" && building.kind === "barracks",
-    );
-    this.resumeAiProduction(currentBarracks);
-  }
-
-  private aiNeedsMoreUnits(
-    minimumUnits: number,
-    currentUnits: number,
-    barracks: BuildingState[],
-  ): boolean {
-    if (currentUnits >= minimumUnits) {
-      return false;
-    }
-    this.aiGoldReserve = 0;
-    this.resumeAiProduction(barracks);
-    return true;
-  }
-
-  private resumeAiProduction(barracks: BuildingState[]): void {
-    for (const building of barracks) {
-      if (building.productionMode !== "running") {
-        this.setBarracksProductionPaused("red", building.id, false);
+    for (const action of plan.actions) {
+      const result = this.executeAiAction(action);
+      if (
+        result.ok &&
+        (action.type === "build" ||
+          action.type === "buildBarracks" ||
+          action.type === "upgrade")
+      ) {
+        // The target was bought; do not hold the same balance for another AI tick.
+        // Production actions earlier in the queue already encode which barracks
+        // should remain deliberately paused.
+        this.aiGoldReserve = 0;
       }
     }
   }
 
-  private aiBuild(kind: Exclude<BuildingKind, "city" | "barracks">): void {
-    const target = this.getCity("blue");
-    const candidates = this.getValidBuildCells("red").sort(
-      (a, b) => hexDistance(a, target) - hexDistance(b, target),
-    );
-    const chosen = candidates[0];
-    if (chosen) {
-      this.build("red", kind, chosen);
-    }
-  }
-
-  private aiBuildBarracks(unitType: UnitType): void {
-    const target = this.getCity("blue");
-    const candidates = this.getValidBuildCells("red").sort(
-      (a, b) => hexDistance(a, target) - hexDistance(b, target),
-    );
-    const chosen = candidates[0];
-    if (chosen) {
-      this.buildBarracks("red", chosen, unitType);
+  private executeAiAction(action: AiAction): CommandResult {
+    switch (action.type) {
+      case "wait":
+        return success();
+      case "build":
+        return this.build("red", action.kind, action.coord);
+      case "buildBarracks":
+        return this.buildBarracks("red", action.coord, action.unitType);
+      case "upgrade":
+        return this.upgrade("red", action.buildingId);
+      case "setProductionPaused":
+        return this.setBarracksProductionPaused("red", action.buildingId, action.paused);
     }
   }
 

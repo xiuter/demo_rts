@@ -21,6 +21,8 @@ export const DEFAULT_CONFIG: GameConfig = {
   aiDecisionInterval: 2,
   // 是否启用红方 AI。
   aiEnabled: true,
+  // null 时每局生成随机种子；指定整数可完整复现 AI 决策。
+  aiSeed: null,
   buildings: {
     city: {
       // 建筑类型标识，主城用于判定胜负。

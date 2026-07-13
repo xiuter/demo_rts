@@ -54,6 +54,8 @@ export interface GameConfig {
   fixedStep: number;
   aiDecisionInterval: number;
   aiEnabled: boolean;
+  /** Fixed AI seed for reproducible matches; null generates one seed per match. */
+  aiSeed: number | null;
   buildings: Record<BuildingKind, BuildingDefinition>;
   units: Record<UnitType, UnitDefinition>;
 }
